@@ -1,0 +1,17 @@
+{
+  "name": "@migrate-block-index-infra/core",
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "test": "sst bind vitest",
+    "typecheck": "tsc -noEmit"
+  },
+  "devDependencies": {
+    "vitest": "^0.34.3",
+    "@types/node": "^20.5.7",
+    "sst": "^2.24.22"
+  },
+  "dependencies": {
+    "zod": "^3.22.2"
+  }
+}
