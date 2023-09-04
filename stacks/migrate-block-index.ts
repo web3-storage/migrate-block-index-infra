@@ -4,6 +4,7 @@ import * as dynamodb from "aws-cdk-lib/aws-dynamodb"
 export function BlockIndexMigrator({ app, stack }: StackContext) {
 
   app.setDefaultFunctionProps({
+    timeout: '15 minutes',
     runtime: "nodejs18.x",
     architecture: "arm_64",
     logRetention: "one_week"
@@ -25,16 +26,16 @@ export function BlockIndexMigrator({ app, stack }: StackContext) {
     consumer: {
       function: {
         handler: "packages/functions/src/consumer.handler",
-        permissions: ["dynamodb:GetItem", "dynamodb:PutItem"],
         bind: [dstTable]
       }
     }
   })
 
   const scanner = new Function(stack, 'scanner', {
+    timeout: '15 minutes',
     handler: "packages/functions/src/scanner.handler",
-    permissions: ["dynamodb:Scan"],
-    bind: [srcTable, batchQueue]
+    bind: [srcTable, batchQueue],
+    permissions: ["ssm:GetParameter", "ssm:PutParameter", "lambda:InvokeFunction"],
   })
 
   stack.addOutputs({
@@ -43,7 +44,7 @@ export function BlockIndexMigrator({ app, stack }: StackContext) {
   })
 }
 
-function env (key: string) {
+function env(key: string) {
   const val = process.env[key]
   if (!val) {
     throw new Error(`${key} must be defined in env`)

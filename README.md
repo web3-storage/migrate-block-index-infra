@@ -20,6 +20,27 @@ To work on this codebase **you need**:
 - Node.js >= v18 (prod env is node v18)
 - Install the deps with `npm i`
 
+## Scanner
+ 
+Lambda to scan an entire DynamoDB table, sending batches of records to an SQS Queue.
+ 
+Stores it's progress in SSM parameter store so it can resume.
+ 
+The lambda invokes itself again when it's remaining execution time is less than `MIN_REMAINING_TIME_MS`, as we only get 15mins max lambda execution time.
+ 
+Invoke it directly with 
+```shell
+aws lambda invoke --function-name <name> --invocation-type Event
+```
+
+Pass `{ TotalSegments: number, Segment: number}` to control the [table scan partition](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Scan.html#Scan.ParallelScan)
+
+With ~858 million records to scan, we will run with 10 segments to complete in about ~3 days.
+```
+~1.5s per 500 records. 
+(858,000,000 recs / 500 batch size) * 1.5s per batch = 2,574,000s = ~30days.
+```
+
 ## Index formats
 
 We need to convert the legacy format to the current format during the migration.

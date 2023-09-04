@@ -6,11 +6,10 @@ import { unmarshall } from '@aws-sdk/util-dynamodb'
 import { DynamoDBClient, ScanCommand, ScanCommandOutput } from '@aws-sdk/client-dynamodb'
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs'
 import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda'
-import { SSMClient, PutParameterCommand, GetParameterCommand } from '@aws-sdk/client-ssm'
+import { SSMClient, PutParameterCommand, GetParameterCommand, ParameterNotFound } from '@aws-sdk/client-ssm'
 
-const SCAN_BATCH_SIZE = 100
-const MIN_REMAINING_TIME_MS = 60_000
-const LAST_EVALUATED_PARAM = `/migrate-block-index/${Config.STAGE}/last-evaluated`
+const SCAN_BATCH_SIZE = 500 // max sqs msg is 256KB. each record is ~350bytes, 350 * 500 = 175KB
+const MIN_REMAINING_TIME_MS = 10_000 // threshold at which we reinvoke the lambda
 
 /**
  * Lambda to scan an entire DynamoDB table, sending batches of records to an SQS Queue.
@@ -21,10 +20,15 @@ const LAST_EVALUATED_PARAM = `/migrate-block-index/${Config.STAGE}/last-evaluate
  * 
  * Invoke it directly with 
  *   aws lambda invoke --function-name <name> --invocation-type Event
+ * 
+ * Pass { TotalSegments: number, Segment: number} to control the table scan partition
+ * see: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Scan.html#Scan.ParallelScan
  */
-export async function handler (event: any, context: Context) {
-  console.log(`invoked: "${JSON.stringify(event)}"`)
-  
+export async function handler(event: any, context: Context) {
+  console.log(`invoked`, event)
+  const TotalSegments = event.TotalSegments ?? 1
+  const Segment = event.Segment ?? 0
+
   // set via the `bind` config in the sst stack
   const tableName = Table.srcTable.tableName
   const queueUrl = Queue.batchQueue.queueUrl
@@ -34,72 +38,84 @@ export async function handler (event: any, context: Context) {
   const dynamo = new DynamoDBClient({})
   const lambda = new LambdaClient({})
 
-  let recordCount = 0
-  let lastEvaluated = await getLastEvaluated(ssm)
+  const ssmKey = `/migrate-block-index/${Config.STAGE}/last-evaluated/${TotalSegments}/${Segment}`
+  let lastEvaluated = await getLastEvaluated(ssm, ssmKey)
 
-  while (recordCount < 500) {
+  let recordCount = 0
+  while (true) {
     const res: ScanCommandOutput = await dynamo.send(new ScanCommand({
+      TotalSegments,
+      Segment,
       ExclusiveStartKey: lastEvaluated,
       TableName: tableName,
       Limit: SCAN_BATCH_SIZE
     }))
 
     if (!res.Items) {
-      console.error('Error: Scan returned no items', JSON.stringify(lastEvaluated))
+      console.error('Error: Scan returned no items', JSON.stringify(lastEvaluated), { TotalSegments, Segment })
       break
     }
     const records = res.Items.map(i => unmarshall(i))
     recordCount += await sendToQueue(sqs, queueUrl, records)
 
-    if(!res.LastEvaluatedKey) {
-      console.log(`Scan complete. Processed ${recordCount} records`)
+    if (!res.LastEvaluatedKey) {
+      console.log(`Scan complete. Processed ${recordCount} records`, { TotalSegments, Segment })
       break // done!
     }
 
-    lastEvaluated = await storeLastEvaluated(ssm, res.LastEvaluatedKey)
-    
-    if (context.getRemainingTimeInMillis() < MIN_REMAINING_TIME_MS) {
-      console.log(`Reinvoking. Processed ${recordCount} records`)
-      await invokeSelf(lambda, context)
+    lastEvaluated = await storeLastEvaluated(ssm, ssmKey, res.LastEvaluatedKey)
+
+    const msRemaining = context.getRemainingTimeInMillis()
+    if (msRemaining < MIN_REMAINING_TIME_MS) {
+      console.log(`Reinvoking. Processed ${recordCount} records, ${msRemaining}ms remain`, { TotalSegments, Segment })
+      await invokeSelf(lambda, event, context)
       break
     }
   }
 
-  return {}
+  return { recordCount, TotalSegments, Segment }
 }
 
-async function sendToQueue (sqs: SQSClient, queueUrl: string, records: Record<string, any>[]) {
+async function sendToQueue(sqs: SQSClient, queueUrl: string, records: Record<string, any>[]) {
   const body = JSON.stringify(records)
   console.log(`Sending batch of ${records.length} with size ${new TextEncoder().encode(body).length}`)
   await sqs.send(new SendMessageCommand({
     QueueUrl: queueUrl,
     MessageBody: body
   }))
-
   return records.length
 }
 
-async function invokeSelf (lambda: LambdaClient, context: Context) {
+async function invokeSelf(lambda: LambdaClient, event: any, context: Context) {
   return lambda.send(new InvokeCommand({
     FunctionName: context.functionName,
     InvocationType: 'Event',
     LogType: 'None',
-  })) 
+    Payload: JSON.stringify(event)
+  }))
 }
 
-async function getLastEvaluated (ssm: SSMClient) {
-  const res = await ssm.send(new GetParameterCommand({
-    Name: LAST_EVALUATED_PARAM
-  }))
-  if (res.Parameter && res.Parameter.Value) {
-    return JSON.parse(res.Parameter.Value)
+async function getLastEvaluated(ssm: SSMClient, key: string) {
+  try {
+    const res = await ssm.send(new GetParameterCommand({
+      Name: key,
+    }))
+    if (res.Parameter && res.Parameter.Value) {
+      return JSON.parse(res.Parameter.Value)
+    }
+  } catch (err) {
+    if (err instanceof ParameterNotFound) {
+      // ok
+      return undefined
+    }
+    throw err
   }
   return undefined
 }
 
-async function storeLastEvaluated (ssm: SSMClient, value: object) {
+async function storeLastEvaluated(ssm: SSMClient, key: string, value: object) {
   await ssm.send(new PutParameterCommand({
-    Name: LAST_EVALUATED_PARAM,
+    Name: key,
     Value: JSON.stringify(value),
     Type: 'String',
     Overwrite: true,
