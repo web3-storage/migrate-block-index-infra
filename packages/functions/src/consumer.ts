@@ -19,6 +19,8 @@ type BlocksCarsPosition = { blockmultihash: string, carpath: string, length: num
  * Transform, check if exists in destination table, and write if missing.
  * 
  * Each record is a stringified array of up to 500 BlocksIndex objects.
+ * 
+ * Failed writes are send to the unprocessedWritesQueue for debugging.
  */
 export async function handler(event: SQSEvent) {
   const dstTable = Table.dstTable.tableName
