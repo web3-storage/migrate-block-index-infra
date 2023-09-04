@@ -41,6 +41,16 @@ With ~858 million records to scan, we will run with 10 segments to complete in a
 (858,000,000 recs / 500 batch size) * 1.5s per batch = 2,574,000s = ~30days.
 ```
 
+## Consumer
+
+Queue consumer lambda to transform items to the current index format, check if they exists in destination table, and write those records that are missing.
+
+Each record is a stringified array of up to 500 BlocksIndex objects from the Scanner.
+ 
+Any failed writes from the DynamoDB BatchWriteCommand are send to the `unprocessedWritesQueue` for debugging and re-driving.
+
+Any other errors and the message is released back to the queue. If that batch fails 3 times, it is send to the `batchDeadLetterQueue`
+
 ## Index formats
 
 We need to convert the legacy format to the current format during the migration.
