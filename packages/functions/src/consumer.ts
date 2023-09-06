@@ -11,8 +11,8 @@ import batch from 'it-batch'
 const BATCH_READ_LIMIT = 100
 const BATCH_WRITE_LIMIT = 25
 
-type BlocksIndex = { multihash: string, cars: Array<{ offset: number, length: number, car: string }> }
-type BlocksCarsPosition = { blockmultihash: string, carpath: string, length: number, offset: number }
+export type BlocksIndex = { multihash: string, cars: Array<{ offset: number, length: number, car: string }> }
+export type BlocksCarsPosition = { blockmultihash: string, carpath: string, length: number, offset: number }
 
 /**
  * Lambda SQS queue consumer.
@@ -29,42 +29,55 @@ export async function handler(event: SQSEvent) {
   const sqs = new SQSClient({})
   const dynamo = new DynamoDBClient({})
 
-  const records: any[] = event.Records
-  for (const r of records) {
-    const items: BlocksIndex[] = JSON.parse(r.body)
-    console.log(`Processing "${items.length}" items`)
-    let writeCount = 0
-    let unprocessedCount = 0
-    // need to capture which ones failed from the batch... so we can put them in the dlq
-    await pipeline(
-      items,
-      async function* (items) {
-        for await (const item of items) {
-          yield* transformItem(item)
-        }
-      },
-      (items) => batch(items, BATCH_READ_LIMIT),
-      async function* (batches) {
-        for await (const batch of batches) {
-          yield* checkExists(dstTable, dynamo, batch)
-        }
-      },
-      (items) => batch(items, BATCH_WRITE_LIMIT),
-      async function* (batches) {
-        for await (const batch of batches) {
-          const unprocessed = await write(dstTable, dynamo, batch)
-          if (unprocessed.length > 0) {
-            await sqs.send(new SendMessageCommand({
-              QueueUrl: unprocessedQueueUrl,
-              MessageBody: JSON.stringify(unprocessed)
-            }))
-          }
-          writeCount += batch.length - unprocessed.length
-          unprocessedCount += unprocessed.length
-        }
+  // the body of each record is an array of BlockIndex items
+  const items: BlocksIndex[] = event.Records.flatMap(r => JSON.parse(r.body))
+
+  console.log(`Processing "${items.length}" items`)
+  const { itemCount, writeCount, unprocessedCount } = await migrator(dstTable, dynamo, items, captureUnprocessedItems(unprocessedQueueUrl, sqs))
+
+  console.log(`Wrote ${writeCount} records. ${unprocessedCount} unprocessed writes`)
+  return { itemCount, writeCount, unprocessedCount }
+}
+
+export async function migrator(dstTable: string, dynamo: DynamoDBClient, items: BlocksIndex[], unprocessedItemHandler: (unprocessed: WriteRequest[]) => Promise<void>) {
+  let itemCount = 0
+  let writeCount = 0
+  let unprocessedCount = 0
+  await pipeline(
+    items,
+    async function* (items) {
+      for await (const item of items) {
+        yield* transformItem(item)
       }
-    )
-    console.log(`Wrote ${writeCount} records. ${unprocessedCount} unprocessed writes`)
+    },
+    (items) => batch(items, BATCH_READ_LIMIT),
+    async function* (batches) {
+      for await (const batch of batches) {
+        itemCount += batch.length
+        yield* checkExists(dstTable, dynamo, batch)
+      }
+    },
+    (items) => batch(items, BATCH_WRITE_LIMIT),
+    async function* (batches) {
+      for await (const batch of batches) {
+        const unprocessed = await write(dstTable, dynamo, batch)
+        if (unprocessed.length > 0) {
+          await unprocessedItemHandler(unprocessed)
+        }
+        writeCount += batch.length - unprocessed.length
+        unprocessedCount += unprocessed.length
+      }
+    }
+  )
+  return { itemCount, writeCount, unprocessedCount }
+}
+
+export function captureUnprocessedItems(queueUrl: string, sqs: SQSClient) {
+  return async function (unprocessed: WriteRequest[]) {
+    await sqs.send(new SendMessageCommand({
+      QueueUrl: queueUrl,
+      MessageBody: JSON.stringify(unprocessed)
+    }))
   }
 }
 
