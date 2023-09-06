@@ -30,31 +30,51 @@ export async function handler(event: SQSEvent) {
   const dynamo = new DynamoDBClient({})
 
   // the body of each record is an array of BlockIndex items
-  const items: BlocksIndex[] = event.Records.flatMap(r => JSON.parse(r.body))
+  const input: BlocksIndex[] = event.Records.flatMap(r => JSON.parse(r.body))
 
-  console.log(`Processing "${items.length}" items`)
-  const { itemCount, writeCount, unprocessedCount } = await migrator(dstTable, dynamo, items, captureUnprocessedItems(unprocessedQueueUrl, sqs))
+  console.log(`Processing ${input.length} BlockIndex items`)
 
-  console.log(`Wrote ${writeCount} records. ${unprocessedCount} unprocessed writes`)
-  return { itemCount, writeCount, unprocessedCount }
+  const transformed: BlocksCarsPosition[] = input.flatMap(transformItem)
+
+  const { writeCount, unprocessedCount } = await writeIfMissing(dstTable, dynamo, transformed, captureUnprocessedItems(unprocessedQueueUrl, sqs))
+
+  console.log(`Wrote ${writeCount} of ${transformed.length} records. ${unprocessedCount} unprocessed writes`)
+
+  return {
+    inputCount: input.length,
+    transformedCount: transformed.length,
+    writeCount,
+    unprocessedCount,
+  }
 }
 
-export async function migrator(dstTable: string, dynamo: DynamoDBClient, items: BlocksIndex[], unprocessedItemHandler: (unprocessed: WriteRequest[]) => Promise<void>) {
+/**
+ * Converts a BlockIndex to 1 or more BlocksCarsPositions
+ */
+export function transformItem(item: BlocksIndex) {
+  const res = []
+  for (const { offset, length, car } of item.cars) {
+    const transformed: BlocksCarsPosition = {
+      blockmultihash: item.multihash,
+      carpath: car,
+      offset,
+      length
+    }
+    res.push(transformed)
+  }
+  return res
+}
+
+export async function writeIfMissing(dstTable: string, dynamo: DynamoDBClient, items: BlocksCarsPosition[], unprocessedItemHandler: (unprocessed: WriteRequest[]) => Promise<void>) {
   let itemCount = 0
   let writeCount = 0
   let unprocessedCount = 0
   await pipeline(
-    items,
-    async function* (items) {
-      for await (const item of items) {
-        yield* transformItem(item)
-      }
-    },
-    (items) => batch(items, BATCH_READ_LIMIT),
+    batch(items, BATCH_READ_LIMIT),
     async function* (batches) {
       for await (const batch of batches) {
         itemCount += batch.length
-        yield* checkExists(dstTable, dynamo, batch)
+        yield* filterExists(dstTable, dynamo, batch)
       }
     },
     (items) => batch(items, BATCH_WRITE_LIMIT),
@@ -82,21 +102,6 @@ export function captureUnprocessedItems(queueUrl: string, sqs: SQSClient) {
 }
 
 /**
- * Converts a BlockIndex to 1 or more BlocksCarsPositions
- */
-export function* transformItem(item: BlocksIndex) {
-  for (const { offset, length, car } of item.cars) {
-    const transformed: BlocksCarsPosition = {
-      blockmultihash: item.multihash,
-      carpath: car,
-      offset,
-      length
-    }
-    yield transformed
-  }
-}
-
-/**
  * Yield records that don't already exist in the dstTable.
  * 
  * This is a cost saving step. A read is much cheaper than a write, so we avoid
@@ -111,7 +116,7 @@ export function* transformItem(item: BlocksIndex) {
  * We ignore any UnprocessedItems from the BatchGetItem response. It will
  * be interpreted as having not existed, and so cause a possibly un-needed write.
  */
-export async function* checkExists(dstTable: string, client: DynamoDBClient, items: BlocksCarsPosition[]) {
+export async function* filterExists(dstTable: string, client: DynamoDBClient, items: BlocksCarsPosition[]) {
   // remove duplicates
   const itemMap: Map<string, BlocksCarsPosition> = new Map()
   for (const item of items) {
