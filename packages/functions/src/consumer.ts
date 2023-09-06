@@ -1,5 +1,4 @@
 import { SQSEvent } from "aws-lambda"
-import { checkExists } from '@migrate-block-index-infra/core'
 
 // transform the records
 // check if they exist in target dynamo

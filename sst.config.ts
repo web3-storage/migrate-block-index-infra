@@ -1,5 +1,5 @@
 import { SSTConfig } from "sst";
-import { BlockIndexMigrator } from "./stacks/migrate-block-index"
+import { BlockIndexMigrator } from "./stacks/migrate-block-index.js"
 
 export default {
   config(_input) {
