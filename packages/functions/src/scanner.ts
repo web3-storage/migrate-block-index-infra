@@ -7,14 +7,15 @@ import { DynamoDBClient, ScanCommand, ScanCommandOutput } from '@aws-sdk/client-
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs'
 import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda'
 import { SSMClient, PutParameterCommand, GetParameterCommand, ParameterNotFound } from '@aws-sdk/client-ssm'
-import retry, { AbortError, Options as RetryOpts } from 'p-retry'
+import retry, { Options as RetryOpts } from 'p-retry'
 
+const STOP_VALUE = 'STOP' // set ssmKey param to this to force the lambda to stop self-invoking
 const SCAN_BATCH_SIZE = 500 // max sqs msg is 256KB. each record is ~350bytes, 350 * 500 = 175KB
-const MIN_REMAINING_TIME_MS = 5 * 60 * 1000 // threshold at which we reinvoke the lambda
+const MIN_REMAINING_TIME_MS = 4 * 60 * 1000 // 4mins. Threshold at which we reinvoke the lambda
 const RETRY_OPTS: RetryOpts = {
-  // spread 10 retries over 2mins
-  // see: https://www.wolframalpha.com/input?i=Sum%5B1000*x%5Ek,+%7Bk,+0,+9%7D%5D+%3D+2+*+60+*+1000
-  factor: 1.5,
+  // spread 10 retries over 1min
+  // see: https://www.wolframalpha.com/input?i=Sum%5B1000*x%5Ek,+%7Bk,+0,+9%7D%5D+%3D+1+*+60+*+1000
+  factor: 1.369,
   retries: 10,
   minTimeout: 1000
 }
@@ -48,9 +49,9 @@ export async function handler(event: any, context: Context) {
 
   const ssmKey = `/migrate-block-index/${Config.STAGE}/last-evaluated/${TotalSegments}/${Segment}`
   let lastEvaluated = await getLastEvaluated(ssm, ssmKey)
-  if (lastEvaluated === false) {
+  if (lastEvaluated === STOP_VALUE) {
     // interpret `false` as a command to stop processing.
-    console.log(`Stopping! Found 'false' under ssm param ${ssmKey}`)
+    console.log(`Stopping! Found ${STOP_VALUE} under ssm param ${ssmKey}`)
     return { TotalSegments, Segment }
   }
 
@@ -127,14 +128,13 @@ async function invokeSelf(lambda: LambdaClient, event: any, context: Context) {
  */
 async function getLastEvaluated(ssm: SSMClient, key: string) {
   const cmd = new GetParameterCommand({ Name: key })
-  return await retry(async () => {
+  const val = await retry(async () => {
     try {
       const res = await ssm.send(cmd)
-      if (res.Parameter && res.Parameter.Value) {
-        return JSON.parse(res.Parameter.Value)
-      } else {
+      if (res.Parameter?.Value === undefined) {
         throw new Error('Parameter.Value missing on ssm GetParameter response')
       }
+      return res.Parameter.Value
     } catch (err) {
       if (err instanceof ParameterNotFound) {
         // ok
@@ -143,6 +143,9 @@ async function getLastEvaluated(ssm: SSMClient, key: string) {
       throw err
     }
   }, RETRY_OPTS)
+
+  // if JSON.parse fails, something is wrong. so let it go boom, so we can investigate.
+  return val ? JSON.parse(val) : val
 }
 
 async function storeLastEvaluated(ssm: SSMClient, key: string, value: object) {
