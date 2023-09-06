@@ -23,25 +23,44 @@ To work on this codebase **you need**:
 ## Scanner
  
 Lambda to scan an entire DynamoDB table, sending batches of records to an SQS Queue.
+
+Invoke it directly:
+
+```bash
+aws lambda invoke --function-name arn-or-name \
+  --invocation-type Event \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"TotalSegments":1,"Segment":0}' ./migrate-out.log
+```
+
+- `--function-name` can be the ARN or the function name
+- `--invocation-type Event` causes the function to be invoked async, so we don't wait for it to complete.
+- `--cli-binary-format` is required to make passing in the payload work! see [aws cli issue](https://github.com/awsdocs/aws-lambda-developer-guide/issues/180#issuecomment-1166923381)
+- `--payload` lets you set the table scan partition parameters as a JSON string, see more details below
+- `./no-such.log` the last arg is the `outfile`, which is required, but unused when invoking async!
+
  
-Stores it's progress in SSM parameter store so it can resume.
+The lambda stores it's progress in SSM parameter store so it can resume.
  
-The lambda invokes itself again when it's remaining execution time is less than `MIN_REMAINING_TIME_MS`, as we only get 15mins max lambda execution time.
+It invokes itself again when it's remaining execution time is less than `MIN_REMAINING_TIME_MS`, as we only get 15mins max lambda execution time.
 
 Set the SSM parameter value to `"STOP"` to force the lambda to stop self-invoking if needed.
- 
-Invoke it directly with 
-```shell
-aws lambda invoke --function-name <name> --invocation-type Event
-```
 
-Pass `{ TotalSegments: number, Segment: number}` to control the [table scan partition](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Scan.html#Scan.ParallelScan)
+### Scan partition
 
-With ~858 million records to scan, we will run with 10 segments to complete in about ~3 days.
+With ~858 million records to scan, 1 worker would take ~30days
+
 ```
-~1.5s per 500 records. 
+@ ~1.5s processing time per 500 records.
 (858,000,000 recs / 500 batch size) * 1.5s per batch = 2,574,000s = ~30days.
 ```
+
+We can use [table scan partition](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Scan.html#Scan.ParallelScan) parameters to split the scan into 10 segments to complete in about ~3 days, by invoking the lambda 10 times in parallel.
+
+Pass `{ TotalSegments: number, Segment: number}` to control the scan partition parameters.
+- `TotalSegments` is how many partitions to divide the full set into e.g `10`
+- `Segment` is the scan partition index that this worker should operate on, e.g `0` for the first.
+
 
 ## Index formats
 
