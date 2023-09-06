@@ -61,5 +61,5 @@ We need to convert the legacy format to the current format during the migration.
 
 | blockmultihash | carPath | length | offset |
 |----------------|---------|--------|--------|
-| `z2D...` | region/bucket/raw/QmX.../315318734258452893/ciq...car | 2765 | 3317501 |
+| `z2D...` | region/bucket/raw/QmX.../315.../ciq...car | 2765 | 3317501 |
 
