@@ -27,6 +27,8 @@ Lambda to scan an entire DynamoDB table, sending batches of records to an SQS Qu
 Stores it's progress in SSM parameter store so it can resume.
  
 The lambda invokes itself again when it's remaining execution time is less than `MIN_REMAINING_TIME_MS`, as we only get 15mins max lambda execution time.
+
+Set the SSM parameter value to `"STOP"` to force the lambda to stop self-invoking if needed.
  
 Invoke it directly with 
 ```shell
