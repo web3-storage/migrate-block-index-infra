@@ -79,10 +79,15 @@ export async function handler(event: any, context: Context) {
     }
 
     lastEvaluated = await storeLastEvaluated(ssm, ssmKey, res.LastEvaluatedKey)
+    if (lastEvaluated === STOP_VALUE) {
+      // interpret `"STOP"` as a command to stop processing.
+      console.log(`Stopping! Found ${STOP_VALUE} under ssm param ${ssmKey}`)
+      return { TotalSegments, Segment }
+    }
 
     const msRemaining = context.getRemainingTimeInMillis()
     if (msRemaining < MIN_REMAINING_TIME_MS) {
-      console.log(`Reinvoking.Processed ${recordCount} records, ${msRemaining}ms remain`, { TotalSegments, Segment })
+      console.log(`Reinvoking. Processed ${recordCount} records, ${msRemaining}ms remain`, { TotalSegments, Segment })
       await invokeSelf(lambda, event, context)
       break
     }
@@ -148,6 +153,11 @@ async function getLastEvaluated(ssm: SSMClient, key: string) {
 }
 
 async function storeLastEvaluated(ssm: SSMClient, key: string, value: object) {
+  const current = await getLastEvaluated(ssm, key)
+  if (current === STOP_VALUE) {
+    return STOP_VALUE
+  }
+
   const cmd = new PutParameterCommand({
     Name: key,
     Value: JSON.stringify(value),
