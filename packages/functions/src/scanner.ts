@@ -50,7 +50,7 @@ export async function handler(event: any, context: Context) {
   const ssmKey = `/migrate-block-index/${Config.STAGE}/last-evaluated/${TotalSegments}/${Segment}`
   let lastEvaluated = await getLastEvaluated(ssm, ssmKey)
   if (lastEvaluated === STOP_VALUE) {
-    // interpret `false` as a command to stop processing.
+    // interpret `"STOP"` as a command to stop processing.
     console.log(`Stopping! Found ${STOP_VALUE} under ssm param ${ssmKey}`)
     return { TotalSegments, Segment }
   }
@@ -67,12 +67,11 @@ export async function handler(event: any, context: Context) {
 
     const res: ScanCommandOutput = await retry(() => dynamo.send(cmd), RETRY_OPTS)
 
-    if (!res.Items) {
-      console.error('Error: Scan returned no items', JSON.stringify(lastEvaluated), { TotalSegments, Segment })
-      break
+    const items = res.Items ?? []
+    if (items.length > 0) {
+      const records = items.map(i => unmarshall(i))
+      recordCount += await sendToQueue(sqs, queueUrl, records)
     }
-    const records = res.Items.map(i => unmarshall(i))
-    recordCount += await sendToQueue(sqs, queueUrl, records)
 
     if (!res.LastEvaluatedKey) {
       console.log(`Scan complete.Processed ${recordCount} records`, { TotalSegments, Segment })
