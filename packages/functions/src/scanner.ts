@@ -12,9 +12,8 @@ import retry, { Options as RetryOpts } from 'p-retry'
 // stored in ssm parameter store save state between invocations
 type Progress = { recordCount: number, lastEvaluated?: Record<string, AttributeValue>, stop?: boolean }
 
-const STOP_VALUE = 'STOP' // set ssmKey param to this to force the lambda to stop self-invoking
-const SCAN_BATCH_SIZE = 100 // max sqs msg is 256KB. each record is ~350bytes, 350 * 500 = 175KB
-const MIN_REMAINING_TIME_MS = (15 * 60 * 1000) - 5000 // 4mins. Threshold at which we reinvoke the lambda
+const SCAN_BATCH_SIZE = 500 // max sqs msg is 256KB. each record is ~350bytes, 350 * 500 = 175KB
+const MIN_REMAINING_TIME_MS = 4 * 60 * 1000 // 4mins. Threshold at which we reinvoke the lambda
 const RETRY_OPTS: RetryOpts = {
   // spread 10 retries over 1min
   // see: https://www.wolframalpha.com/input?i=Sum%5B1000*x%5Ek,+%7Bk,+0,+9%7D%5D+%3D+1+*+60+*+1000
@@ -55,7 +54,7 @@ export async function handler(event: any, context: Context) {
   const prevProgress = await getProgress(ssm, progressKey)
 
   if (prevProgress.stop) {
-    console.log(`Stopping! Found ${STOP_VALUE} under ssm param ${progressKey}`, prevProgress)
+    console.log(`Stopping! Found stop: true under ssm param ${progressKey}`, prevProgress)
     return { TotalSegments, Segment, ...prevProgress }
   }
 
