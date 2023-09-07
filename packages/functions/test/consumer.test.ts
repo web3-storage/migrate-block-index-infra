@@ -1,5 +1,5 @@
 import { expect, test, vi } from 'vitest'
-import { transformItem, writeIfMissing, BlocksIndex, BlocksCarsPosition } from '../src/consumer'
+import { transformItem, writeIfMissing, BlocksIndex, BlocksCarsPosition } from '../src/consumer.js'
 import { mockClient } from 'aws-sdk-client-mock'
 import { marshall } from '@aws-sdk/util-dynamodb'
 import { DynamoDBClient, BatchGetItemCommand, BatchWriteItemCommand } from '@aws-sdk/client-dynamodb'
