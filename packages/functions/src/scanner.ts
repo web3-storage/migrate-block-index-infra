@@ -3,15 +3,18 @@ import { Table } from 'sst/node/table'
 import { Queue } from 'sst/node/queue'
 import { Context } from 'aws-lambda'
 import { unmarshall } from '@aws-sdk/util-dynamodb'
-import { DynamoDBClient, ScanCommand, ScanCommandOutput } from '@aws-sdk/client-dynamodb'
+import { AttributeValue, DynamoDBClient, ScanCommand, ScanCommandOutput } from '@aws-sdk/client-dynamodb'
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs'
 import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda'
 import { SSMClient, PutParameterCommand, GetParameterCommand, ParameterNotFound } from '@aws-sdk/client-ssm'
 import retry, { Options as RetryOpts } from 'p-retry'
 
+// stored in ssm parameter store save state between invocations
+type Progress = { recordCount: number, lastEvaluated?: Record<string, AttributeValue>, stop?: boolean }
+
 const STOP_VALUE = 'STOP' // set ssmKey param to this to force the lambda to stop self-invoking
-const SCAN_BATCH_SIZE = 500 // max sqs msg is 256KB. each record is ~350bytes, 350 * 500 = 175KB
-const MIN_REMAINING_TIME_MS = 4 * 60 * 1000 // 4mins. Threshold at which we reinvoke the lambda
+const SCAN_BATCH_SIZE = 100 // max sqs msg is 256KB. each record is ~350bytes, 350 * 500 = 175KB
+const MIN_REMAINING_TIME_MS = (15 * 60 * 1000) - 5000 // 4mins. Threshold at which we reinvoke the lambda
 const RETRY_OPTS: RetryOpts = {
   // spread 10 retries over 1min
   // see: https://www.wolframalpha.com/input?i=Sum%5B1000*x%5Ek,+%7Bk,+0,+9%7D%5D+%3D+1+*+60+*+1000
@@ -47,15 +50,23 @@ export async function handler(event: any, context: Context) {
   const dynamo = new DynamoDBClient({})
   const lambda = new LambdaClient({})
 
-  const ssmKey = `/migrate-block-index/${Config.STAGE}/last-evaluated/${TotalSegments}/${Segment}`
-  let lastEvaluated = await getLastEvaluated(ssm, ssmKey)
-  if (lastEvaluated === STOP_VALUE) {
-    // interpret `"STOP"` as a command to stop processing.
-    console.log(`Stopping! Found ${STOP_VALUE} under ssm param ${ssmKey}`)
-    return { TotalSegments, Segment }
+  const stopKey = `/migrate-block-index/${Config.STAGE}/stop`
+  const progressKey = `/migrate-block-index/${Config.STAGE}/${TotalSegments}/${Segment}/progress`
+  const prevProgress = await getProgress(ssm, progressKey)
+
+  if (prevProgress.stop) {
+    console.log(`Stopping! Found ${STOP_VALUE} under ssm param ${progressKey}`, prevProgress)
+    return { TotalSegments, Segment, ...prevProgress }
   }
 
-  let recordCount = 0
+  if (await checkStop(ssm, stopKey)) {
+    console.log(`Stopping! Found global stop param ${stopKey}`, prevProgress)
+    return { TotalSegments, Segment, ...prevProgress }
+  }
+
+  // init loop info from previous progress report
+  let { lastEvaluated, recordCount } = prevProgress
+
   while (true) {
     const cmd = new ScanCommand({
       TotalSegments,
@@ -70,19 +81,24 @@ export async function handler(event: any, context: Context) {
     const items = res.Items ?? []
     if (items.length > 0) {
       const records = items.map(i => unmarshall(i))
-      recordCount += await sendToQueue(sqs, queueUrl, records)
+      await sendToQueue(sqs, queueUrl, records)
     }
 
-    if (!res.LastEvaluatedKey) {
-      console.log(`Scan complete.Processed ${recordCount} records`, { TotalSegments, Segment })
+    lastEvaluated = res.LastEvaluatedKey
+    recordCount += items.length
+
+    const progress = { recordCount, lastEvaluated, stop: lastEvaluated === undefined }
+    await storeProgress(ssm, progressKey, progress)
+
+    // lastEvaluated is undefined when we reach the end of our scan partition
+    if (lastEvaluated === undefined) {
+      console.log(`Scan complete. Processed ${recordCount} records`, { TotalSegments, Segment })
       break // done!
     }
 
-    lastEvaluated = await storeLastEvaluated(ssm, ssmKey, res.LastEvaluatedKey)
-    if (lastEvaluated === STOP_VALUE) {
-      // interpret `"STOP"` as a command to stop processing.
-      console.log(`Stopping! Found ${STOP_VALUE} under ssm param ${ssmKey}`)
-      return { TotalSegments, Segment }
+    if (await checkStop(ssm, stopKey)) {
+      console.log(`Stopping! Found global stop param ${stopKey}`, progress)
+      return { TotalSegments, Segment, ...progress }
     }
 
     const msRemaining = context.getRemainingTimeInMillis()
@@ -93,7 +109,7 @@ export async function handler(event: any, context: Context) {
     }
   }
 
-  return { recordCount, TotalSegments, Segment }
+  return { TotalSegments, Segment, recordCount, lastEvaluated }
 }
 
 async function sendToQueue(sqs: SQSClient, queueUrl: string, records: Record<string, any>[]) {
@@ -126,11 +142,31 @@ async function invokeSelf(lambda: LambdaClient, event: any, context: Context) {
 
 /**
  * Gets the last evaluated key so we can continue the scan from where we left off.
- *
- * Expect a ParameterNotFound error on the first call, as it is only set after we
- * have processed the first batch.
  */
-async function getLastEvaluated(ssm: SSMClient, key: string) {
+async function getProgress(ssm: SSMClient, progressKey: string): Promise<Progress> {
+  const val = await getKey(ssm, progressKey)
+  if (val) {
+    const res = JSON.parse(val)
+    return {
+      stop: res.stop,
+      lastEvaluated: res.lastEvaluated,
+      recordCount: res.recordCount ?? 0
+    }
+  }
+  return { stop: false, lastEvaluated: undefined, recordCount: 0 }
+}
+
+/**
+ * Check the global stop key. If a value exists, return true, else false
+ */
+async function checkStop(ssm: SSMClient, stopKey: string) {
+  return Boolean(await getKey(ssm, stopKey))
+}
+
+/**
+ * Get the value for an SSM parameter. or return undefined for ParameterNotFound errors.
+ */
+async function getKey(ssm: SSMClient, key: string) {
   const cmd = new GetParameterCommand({ Name: key })
   const val = await retry(async () => {
     try {
@@ -147,17 +183,10 @@ async function getLastEvaluated(ssm: SSMClient, key: string) {
       throw err
     }
   }, RETRY_OPTS)
-
-  // if JSON.parse fails, something is wrong. so let it go boom, so we can investigate.
-  return val ? JSON.parse(val) : val
+  return val
 }
 
-async function storeLastEvaluated(ssm: SSMClient, key: string, value: object) {
-  const current = await getLastEvaluated(ssm, key)
-  if (current === STOP_VALUE) {
-    return STOP_VALUE
-  }
-
+async function storeProgress(ssm: SSMClient, key: string, value: Progress) {
   const cmd = new PutParameterCommand({
     Name: key,
     Value: JSON.stringify(value),

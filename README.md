@@ -44,7 +44,7 @@ The lambda stores it's progress in SSM parameter store so it can resume.
  
 It invokes itself again when it's remaining execution time is less than `MIN_REMAINING_TIME_MS`, as we only get 15mins max lambda execution time.
 
-Set the SSM parameter value to `"STOP"` to force the lambda to stop self-invoking if needed.
+Create an SSM parameter with name `/migrate-block-index/${Config.STAGE}/stop` to abort all currently running invocations for that stage e.g `/migrate-block-index/prod/stop` and set the value to any string e.g. STOP. The existence of a value for that key is the signal to stop.
 
 ### Scan partition
 
