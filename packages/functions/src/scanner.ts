@@ -72,7 +72,8 @@ export async function handler(event: any, context: Context) {
       Segment,
       ExclusiveStartKey: lastEvaluated,
       TableName: tableName,
-      Limit: SCAN_BATCH_SIZE
+      Limit: SCAN_BATCH_SIZE,
+      AttributesToGet: ['multihash', 'cars']
     })
 
     const res: ScanCommandOutput = await retry(() => dynamo.send(cmd), RETRY_OPTS)
