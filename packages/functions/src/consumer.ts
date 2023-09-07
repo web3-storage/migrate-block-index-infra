@@ -1,7 +1,7 @@
 import { pipeline } from 'node:stream/promises'
 import { Table } from 'sst/node/table'
 import { Queue } from 'sst/node/queue'
-import { SQSEvent } from 'aws-lambda'
+import { SQSEvent, Context } from 'aws-lambda'
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs'
 import { DynamoDBClient, BatchGetItemCommand, BatchWriteItemCommand, WriteRequest } from '@aws-sdk/client-dynamodb'
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb'
@@ -22,7 +22,7 @@ export type BlocksCarsPosition = { blockmultihash: string, carpath: string, leng
  * 
  * Failed writes are send to the unprocessedWritesQueue for debugging.
  */
-export async function handler(event: SQSEvent) {
+export async function handler(event: SQSEvent, context: Context) {
   const dstTable = Table.dstTable.tableName
   const unprocessedQueueUrl = Queue.unprocessedWritesQueue.queueUrl
 
@@ -38,13 +38,16 @@ export async function handler(event: SQSEvent) {
 
   const { writeCount, unprocessedCount } = await writeIfMissing(dstTable, dynamo, transformed, captureUnprocessedItems(unprocessedQueueUrl, sqs))
 
-  console.log(`Wrote ${writeCount} of ${transformed.length} records. ${unprocessedCount} unprocessed writes`)
+  const msRemain = context.getRemainingTimeInMillis()
+
+  console.log(`Wrote ${writeCount} of ${transformed.length} records. ${unprocessedCount} unprocessed writes. ${msRemain}ms remain`)
 
   return {
     inputCount: input.length,
     transformedCount: transformed.length,
     writeCount,
     unprocessedCount,
+    msRemain
   }
 }
 

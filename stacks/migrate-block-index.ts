@@ -53,6 +53,12 @@ export function BlockIndexMigrator({ app, stack }: StackContext) {
       }
     },
     consumer: {
+      cdk: {
+        eventSource: {
+          batchSize: 20, // default 10
+          maxBatchingWindow: Duration.seconds(1) // default 500ms
+        }
+      },
       function: {
         handler: "packages/functions/src/consumer.handler",
         bind: [dstTable, unprocessedWritesQueue]
