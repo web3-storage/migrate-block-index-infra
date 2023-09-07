@@ -92,18 +92,18 @@ export async function handler(event: any, context: Context) {
 
     // lastEvaluated is undefined when we reach the end of our scan partition
     if (lastEvaluated === undefined) {
-      console.log(`Scan complete. Processed ${recordCount} records`, { TotalSegments, Segment })
+      console.log(`Scan complete. Processed ${recordCount} records`, { TotalSegments, Segment, ...progress })
       break // done!
     }
 
     if (await checkStop(ssm, stopKey)) {
-      console.log(`Stopping! Found global stop param ${stopKey}`, progress)
-      return { TotalSegments, Segment, ...progress }
+      console.log(`Stopping! Found global stop param ${stopKey}`, { TotalSegments, Segment, ...progress })
+      break
     }
 
     const msRemaining = context.getRemainingTimeInMillis()
     if (msRemaining < MIN_REMAINING_TIME_MS) {
-      console.log(`Reinvoking. Processed ${recordCount} records, ${msRemaining}ms remain`, { TotalSegments, Segment })
+      console.log(`Reinvoking. Processed ${recordCount} records, ${msRemaining}ms remain`, { TotalSegments, Segment, ...progress })
       await invokeSelf(lambda, event, context)
       break
     }
