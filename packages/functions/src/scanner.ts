@@ -3,13 +3,24 @@ import { Table } from 'sst/node/table'
 import { Queue } from 'sst/node/queue'
 import { Context } from 'aws-lambda'
 import { unmarshall } from '@aws-sdk/util-dynamodb'
-import { DynamoDBClient, ScanCommand, ScanCommandOutput } from '@aws-sdk/client-dynamodb'
+import { AttributeValue, DynamoDBClient, ScanCommand, ScanCommandOutput } from '@aws-sdk/client-dynamodb'
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs'
 import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda'
 import { SSMClient, PutParameterCommand, GetParameterCommand, ParameterNotFound } from '@aws-sdk/client-ssm'
+import retry, { Options as RetryOpts } from 'p-retry'
+
+// stored in ssm parameter store save state between invocations
+type Progress = { recordCount: number, lastEvaluated?: Record<string, AttributeValue>, stop?: boolean }
 
 const SCAN_BATCH_SIZE = 500 // max sqs msg is 256KB. each record is ~350bytes, 350 * 500 = 175KB
-const MIN_REMAINING_TIME_MS = 10_000 // threshold at which we reinvoke the lambda
+const MIN_REMAINING_TIME_MS = 4 * 60 * 1000 // 4mins. Threshold at which we reinvoke the lambda
+const RETRY_OPTS: RetryOpts = {
+  // spread 10 retries over 1min
+  // see: https://www.wolframalpha.com/input?i=Sum%5B1000*x%5Ek,+%7Bk,+0,+9%7D%5D+%3D+1+*+60+*+1000
+  factor: 1.369,
+  retries: 10,
+  minTimeout: 1000
+}
 
 /**
  * Lambda to scan an entire DynamoDB table, sending batches of records to an SQS Queue.
@@ -21,11 +32,11 @@ const MIN_REMAINING_TIME_MS = 10_000 // threshold at which we reinvoke the lambd
  * Invoke it directly with 
  *   aws lambda invoke --function-name <name> --invocation-type Event
  * 
- * Pass { TotalSegments: number, Segment: number} to control the table scan partition
+ * Pass { TotalSegments: number, Segment: number } to control the table scan partition
  * see: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Scan.html#Scan.ParallelScan
  */
 export async function handler(event: any, context: Context) {
-  console.log(`invoked`, event)
+  console.log('invoked', event)
   const TotalSegments = event.TotalSegments ?? 1
   const Segment = event.Segment ?? 0
 
@@ -38,88 +49,151 @@ export async function handler(event: any, context: Context) {
   const dynamo = new DynamoDBClient({})
   const lambda = new LambdaClient({})
 
-  const ssmKey = `/migrate-block-index/${Config.STAGE}/last-evaluated/${TotalSegments}/${Segment}`
-  let lastEvaluated = await getLastEvaluated(ssm, ssmKey)
+  const stopKey = `/migrate-block-index/${Config.STAGE}/stop`
+  const progressKey = `/migrate-block-index/${Config.STAGE}/${TotalSegments}/${Segment}/progress`
+  const prevProgress = await getProgress(ssm, progressKey)
 
-  let recordCount = 0
+  if (prevProgress.stop) {
+    console.log(`Stopping! Found stop: true under ssm param ${progressKey}`, prevProgress)
+    return { TotalSegments, Segment, ...prevProgress }
+  }
+
+  if (await checkStop(ssm, stopKey)) {
+    console.log(`Stopping! Found global stop param ${stopKey}`, prevProgress)
+    return { TotalSegments, Segment, ...prevProgress }
+  }
+
+  // init loop info from previous progress report
+  let { lastEvaluated, recordCount } = prevProgress
+
   while (true) {
-    const res: ScanCommandOutput = await dynamo.send(new ScanCommand({
+    const cmd = new ScanCommand({
       TotalSegments,
       Segment,
       ExclusiveStartKey: lastEvaluated,
       TableName: tableName,
-      Limit: SCAN_BATCH_SIZE
-    }))
+      Limit: SCAN_BATCH_SIZE,
+      AttributesToGet: ['multihash', 'cars']
+    })
 
-    if (!res.Items) {
-      console.error('Error: Scan returned no items', JSON.stringify(lastEvaluated), { TotalSegments, Segment })
-      break
+    const res: ScanCommandOutput = await retry(() => dynamo.send(cmd), RETRY_OPTS)
+
+    const items = res.Items ?? []
+    if (items.length > 0) {
+      const records = items.map(i => unmarshall(i))
+      await sendToQueue(sqs, queueUrl, records)
     }
-    const records = res.Items.map(i => unmarshall(i))
-    recordCount += await sendToQueue(sqs, queueUrl, records)
 
-    if (!res.LastEvaluatedKey) {
-      console.log(`Scan complete. Processed ${recordCount} records`, { TotalSegments, Segment })
+    lastEvaluated = res.LastEvaluatedKey
+    recordCount += items.length
+
+    const progress = { recordCount, lastEvaluated, stop: lastEvaluated === undefined }
+    await storeProgress(ssm, progressKey, progress)
+
+    // lastEvaluated is undefined when we reach the end of our scan partition
+    if (lastEvaluated === undefined) {
+      console.log(`Scan complete. Processed ${recordCount} records`, { TotalSegments, Segment, ...progress })
       break // done!
     }
 
-    lastEvaluated = await storeLastEvaluated(ssm, ssmKey, res.LastEvaluatedKey)
+    if (await checkStop(ssm, stopKey)) {
+      console.log(`Stopping! Found global stop param ${stopKey}`, { TotalSegments, Segment, ...progress })
+      break
+    }
 
     const msRemaining = context.getRemainingTimeInMillis()
     if (msRemaining < MIN_REMAINING_TIME_MS) {
-      console.log(`Reinvoking. Processed ${recordCount} records, ${msRemaining}ms remain`, { TotalSegments, Segment })
+      console.log(`Reinvoking. Processed ${recordCount} records, ${msRemaining}ms remain`, { TotalSegments, Segment, ...progress })
       await invokeSelf(lambda, event, context)
       break
     }
   }
 
-  return { recordCount, TotalSegments, Segment }
+  return { TotalSegments, Segment, recordCount, lastEvaluated }
 }
 
 async function sendToQueue(sqs: SQSClient, queueUrl: string, records: Record<string, any>[]) {
   const body = JSON.stringify(records)
-  console.log(`Sending batch of ${records.length} with size ${new TextEncoder().encode(body).length}`)
-  await sqs.send(new SendMessageCommand({
+  console.log(`Sending batch of ${records.length} with size ${new TextEncoder().encode(body).length} `)
+  const cmd = new SendMessageCommand({
     QueueUrl: queueUrl,
     MessageBody: body
-  }))
+  })
+  await retry(() => sqs.send(cmd), RETRY_OPTS)
   return records.length
 }
 
+/**
+ * Invoke the currently executing lambda again.
+ * Extract the lambda function name from the context.
+ * 
+ * `InvocationType: 'Event'` invokes the lambda async. We only wait for the invocation
+ * command to be successful. The current lambda does not wait for the invoked to complete.
+ */
 async function invokeSelf(lambda: LambdaClient, event: any, context: Context) {
-  return lambda.send(new InvokeCommand({
+  const cmd = new InvokeCommand({
     FunctionName: context.functionName,
     InvocationType: 'Event',
     LogType: 'None',
     Payload: JSON.stringify(event)
-  }))
+  })
+  return retry(() => lambda.send(cmd), RETRY_OPTS)
 }
 
-async function getLastEvaluated(ssm: SSMClient, key: string) {
-  try {
-    const res = await ssm.send(new GetParameterCommand({
-      Name: key,
-    }))
-    if (res.Parameter && res.Parameter.Value) {
-      return JSON.parse(res.Parameter.Value)
+/**
+ * Gets the last evaluated key so we can continue the scan from where we left off.
+ */
+async function getProgress(ssm: SSMClient, progressKey: string): Promise<Progress> {
+  const val = await getKey(ssm, progressKey)
+  if (val) {
+    const res = JSON.parse(val)
+    return {
+      stop: res.stop,
+      lastEvaluated: res.lastEvaluated,
+      recordCount: res.recordCount ?? 0
     }
-  } catch (err) {
-    if (err instanceof ParameterNotFound) {
-      // ok
-      return undefined
-    }
-    throw err
   }
-  return undefined
+  return { stop: false, lastEvaluated: undefined, recordCount: 0 }
 }
 
-async function storeLastEvaluated(ssm: SSMClient, key: string, value: object) {
-  await ssm.send(new PutParameterCommand({
+/**
+ * Check the global stop key. If a value exists, return true, else false
+ */
+async function checkStop(ssm: SSMClient, stopKey: string) {
+  return Boolean(await getKey(ssm, stopKey))
+}
+
+/**
+ * Get the value for an SSM parameter. or return undefined for ParameterNotFound errors.
+ */
+async function getKey(ssm: SSMClient, key: string) {
+  const cmd = new GetParameterCommand({ Name: key })
+  const val = await retry(async () => {
+    try {
+      const res = await ssm.send(cmd)
+      if (res.Parameter?.Value === undefined) {
+        throw new Error('Parameter.Value missing on ssm GetParameter response')
+      }
+      return res.Parameter.Value
+    } catch (err) {
+      if (err instanceof ParameterNotFound) {
+        // ok
+        return undefined
+      }
+      throw err
+    }
+  }, RETRY_OPTS)
+  return val
+}
+
+async function storeProgress(ssm: SSMClient, key: string, value: Progress) {
+  const cmd = new PutParameterCommand({
     Name: key,
     Value: JSON.stringify(value),
     Type: 'String',
     Overwrite: true,
     Tier: 'Standard'
-  }))
+  })
+  await retry(() => ssm.send(cmd), RETRY_OPTS)
   return value
 }
