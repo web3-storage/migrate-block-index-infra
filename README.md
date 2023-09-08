@@ -61,6 +61,35 @@ Pass `{ TotalSegments: number, Segment: number}` to control the scan partition p
 - `TotalSegments` is how many partitions to divide the full set into e.g `10`
 - `Segment` is the scan partition index that this worker should operate on, e.g `0` for the first.
 
+## Consumer
+
+Queue consumer lambda to transform items to the current index format, check if they exists in destination table, and write those records that are missing.
+
+Each record is a stringified array of up to 500 BlocksIndex objects from the Scanner.
+ 
+Any failed writes from the DynamoDB BatchWriteCommand are send to the `unprocessedWritesQueue` for debugging and re-driving.
+
+Any other errors and the message is released back to the queue. If that batch fails 3 times, it is send to the `batchDeadLetterQueue`
+
+### Scaling
+
+Lambda SQS consumer scaling is managed by AWS. But we can control how the batching is managed.
+
+- `MaximumBatchingWindowInSeconds` - _default: 500ms_. Time, in seconds, that Lambda spends gathering records before invoking the function. Any value from 0 seconds to 300 seconds in increments of seconds.
+- `BatchSize` - _default: 500ms_ The maximum number of records in each batch that Lambda pulls from your stream or queue and sends to your function. Lambda passes all of the records in the batch to the function in a single call, up to the payload limit for synchronous invocation (6 MB). When you set BatchSize to a value greater than 10, you must set MaximumBatchingWindowInSeconds to at least 1.
+
+source: https://docs.aws.amazon.com/lambda/latest/dg/API_EventSourceMappingConfiguration.html
+
+Setting batch size to `20` will send 10k records to the per invocation. `(20 * 500 = 10,000)`
+
+> When a Lambda function subscribes to an SQS queue, Lambda polls the queue as it waits for messages to arrive. Lambda consumes messages in batches, starting at five concurrent batches with five functions at a time.
+>
+> If there are more messages in the queue, Lambda adds up to 60 functions per minute, up to 1,000 functions, to consume those messages. This means that Lambda can scale up to 1,000 concurrent Lambda functions processing messages from the SQS queue.
+>
+> This scaling behavior is managed by AWS and cannot be modified.
+> 
+> By default, Lambda batches up to 10 messages in a queue to process them during a single Lambda execution.
+- https://aws.amazon.com/blogs/compute/understanding-how-aws-lambda-scales-when-subscribed-to-amazon-sqs-queues/
 
 ## Index formats
 
@@ -82,3 +111,73 @@ We need to convert the legacy format to the current format during the migration.
 |----------------|---------|--------|--------|
 | `z2D...` | region/bucket/raw/QmX.../315.../ciq...car | 2765 | 3317501 |
 
+## Costs
+
+This will be used to migrate indexes from the `blocks` table to the `blocks-cars-position` table.
+
+### Source table scan cost
+
+`blocks` table stats
+
+| Item count    | Table size | Average item size
+|---------------|------------|-----------------
+| 858 million   | 273 GB     | 319 bytes
+
+- 4k / 319 bytes = 12 items per 1 RCU _(eventaully consistent, cheap read, not transaction)_
+- 858 million / 12 = 71 million RCUs 
+- 71 * $0.25 per million = **$17 for a full table scan**
+
+### Destination table write cost
+
+`blocks-cars-position` table stats
+
+| Item count    | Table size | Average item size
+|---------------|------------|-----------------
+| 43 billion    | 11 TB      | 255 bytes
+
+Assuming we have to write 1 new record for every source record
+
+- 1kb / 255 bytes = 3 items per WCU
+- 858 million / 3 items per WCU = 286 million WCUs
+- 286 * $1.25 per million = **$357.5 total write cost**
+
+but initial explorations suggest we will actually only need to write 1% of the source table to the dst table. So the write cost will likely be very cheap as long we check for existence before attempting writes. Alas conditional writes cost as much as a write even if not write occurs.
+
+### Lambda costs
+
+On the consumer side, with `BatchSize: 20` we will process 10,000 records per invocation.
+- 869 million / 10,000 = 85900 invocations.
+- Estimate 10s to 30s per 10k processing time
+- 1Gb ram
+- = ~$30
+
+On the scanner side
+- @ ~1.5s processing time per 500 records.
+- running for 11mins per invocation
+- ((11 * 60) / 1.5) * 500 = 220,000 records per invocation
+- 859 million / 220,000 recs per invocation = ~1,600 invocations
+- = ~$9
+
+per https://calculator.aws/#/addService/Lambda
+
+### SQS costs
+
+- 859,000,000 / 500 = 1,718,000 puts to the queue
+- 3,436,000 queue ops
+- ~$1
+
+per https://calculator.aws/#/addService/SQS
+
+### References
+
+> Write operation costs $1.25 per million requests.
+> Read operation costs $0.25 per million requests.
+– https://dashbird.io/knowledge-base/dynamodb/dynamodb-pricing/
+
+>Read consumption: Measured in 4KB increments (rounded up!) for each read operation. This is the amount of data that is read from the table or index... if you read a single 10KB item in DynamoDB, you will consume 3 RCUs (10 / 4 == 2.5, rounded up to 3).
+>
+> Write consumption: Measured in 1KB increments (also rounded up!) for each write operation. This is the size of the item you're writing / updating / deleting during a write operation... if you write a single 7.5KB item in DynamoDB, you will consume 8 WCUs (7.5 / 1 == 7.5, rounded up to 8).
+– https://www.alexdebrie.com/posts/dynamodb-costs/
+
+> If a ConditionExpression evaluates to false during a conditional write, DynamoDB still consumes write capacity from the table. The amount consumed is dependent on the size of the item (whether it’s an existing item in the table or a new one you are attempting to create or update). For example, if an existing item is 300kb and the new item you are trying to create or update is 310kb, the write capacity units consumed will be the 310kb item.
+– https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/WorkingWithItems.html#WorkingWithItems.ConditionalUpdate

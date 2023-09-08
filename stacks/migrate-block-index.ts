@@ -1,5 +1,6 @@
 import { StackContext, Function, Queue, Table } from "sst/constructs"
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb"
+import { Duration } from "aws-cdk-lib/core"
 
 export function BlockIndexMigrator({ app, stack }: StackContext) {
 
@@ -22,11 +23,45 @@ export function BlockIndexMigrator({ app, stack }: StackContext) {
     }
   })
 
+  const unprocessedWritesQueue = new Queue(stack, 'unprocessedWritesQueue', {
+    cdk: {
+      queue: {
+        retentionPeriod: Duration.days(14),
+        visibilityTimeout: Duration.minutes(15)
+      }
+    }
+  })
+
+  const batchDeadLetterQueue = new Queue(stack, 'batchDeadLetterQueue', {
+    cdk: {
+      queue: {
+        retentionPeriod: Duration.days(14),
+        visibilityTimeout: Duration.minutes(15)
+      }
+    }
+  })
+
   const batchQueue = new Queue(stack, 'batchQueue', {
+    cdk: {
+      queue: {
+        retentionPeriod: Duration.days(14),
+        visibilityTimeout: Duration.minutes(15),
+        deadLetterQueue: {
+          queue: batchDeadLetterQueue.cdk.queue,
+          maxReceiveCount: 3
+        }
+      }
+    },
     consumer: {
+      cdk: {
+        eventSource: {
+          batchSize: 20, // default 10
+          maxBatchingWindow: Duration.seconds(1) // default 500ms
+        }
+      },
       function: {
         handler: "packages/functions/src/consumer.handler",
-        bind: [dstTable]
+        bind: [dstTable, unprocessedWritesQueue]
       }
     }
   })
