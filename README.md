@@ -160,7 +160,7 @@ On the scanner side
 
 per https://calculator.aws/#/addService/Lambda
 
-### SQS costs
+### SQS costs
 
 - 859,000,000 / 500 = 1,718,000 puts to the queue
 - 3,436,000 queue ops
