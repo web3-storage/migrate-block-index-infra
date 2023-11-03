@@ -71,7 +71,7 @@ Any failed writes from the DynamoDB BatchWriteCommand are send to the `unprocess
 
 Any other errors and the message is released back to the queue. If that batch fails 3 times, it is send to the `batchDeadLetterQueue`
 
-### Scaling
+### Scaling
 
 Lambda SQS consumer scaling is managed by AWS. But we can control how the batching is managed.
 
